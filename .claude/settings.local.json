@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//usr/local/bin/**)",
+      "Read(//opt/homebrew/bin/**)",
+      "Bash(export PATH=\"/usr/local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH\")"
+    ]
+  }
+}
