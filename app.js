@@ -35,43 +35,61 @@ const state = {
   tab: 'home',
 };
 
-// ─── Firebase sync (REST, no SDK) ────────────────────────────
+// ─── Firebase real-time sync ──────────────────────────────────
 const FIREBASE_URL = 'https://elior-hadar-default-rtdb.firebaseio.com';
 
-const SYNC = {
-  getUrl()      { return (localStorage.getItem('fc_firebase_url') || FIREBASE_URL).replace(/\/$/, ''); },
-  setUrl(u)     { localStorage.setItem('fc_firebase_url', u.trim().replace(/\/$/, '')); },
-  hasUrl()      { return true; },
+function fbPush(key, value) {
+  fetch(`${FIREBASE_URL}/data/${key}.json`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(value),
+  }).catch(() => {});
+}
 
-  async read(path) {
+let _sse = null;
+let _ignoreNextRender = false;
+
+function startRealtimeSync() {
+  if (_sse) { _sse.close(); _sse = null; }
+
+  _sse = new EventSource(`${FIREBASE_URL}/data.json`);
+
+  _sse.addEventListener('put', e => {
     try {
-      const r = await fetch(`${SYNC.getUrl()}/${path}.json`);
-      return r.ok ? await r.json() : null;
-    } catch { return null; }
-  },
+      const { path, data } = JSON.parse(e.data);
+      if (!data) return;
+      if (path === '/') {
+        Object.entries(data).forEach(([k, v]) => {
+          if (!k.includes('photo')) localStorage.setItem(k, JSON.stringify(v));
+        });
+      } else {
+        const key = path.replace(/^\//, '');
+        if (!key.includes('photo')) localStorage.setItem(key, JSON.stringify(data));
+      }
+      if (state.profile && !_ignoreNextRender) {
+        renderActiveTab();
+        updateStreakBadge();
+      }
+      _ignoreNextRender = false;
+    } catch {}
+  });
 
-  push(path, data) {
-    if (!SYNC.hasUrl()) return;
-    fetch(`${SYNC.getUrl()}/${path}.json`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    }).catch(() => {});
-  },
-};
+  _sse.addEventListener('patch', e => {
+    try {
+      const { path, data } = JSON.parse(e.data);
+      if (!data) return;
+      const base = path.replace(/^\//, '');
+      Object.entries(data).forEach(([k, v]) => {
+        const key = base ? `${base}/${k}` : k;
+        if (!key.includes('photo')) localStorage.setItem(key, JSON.stringify(v));
+      });
+      if (state.profile) { renderActiveTab(); updateStreakBadge(); }
+    } catch {}
+  });
+}
 
-// Pull all data from Firebase into localStorage (called on app load)
-async function syncFromFirebase() {
-  if (!SYNC.hasUrl()) return;
-  showSyncBadge('מסנכרן...');
-  try {
-    const all = await SYNC.read('data');
-    if (!all) { hideSyncBadge(); return; }
-    Object.entries(all).forEach(([k, v]) => {
-      // skip photos (too large, keep local)
-      if (!k.includes('_photo')) localStorage.setItem(k, JSON.stringify(v));
-    });
-    hideSyncBadge('✓ מסונכרן');
-  } catch { hideSyncBadge(); }
+function stopRealtimeSync() {
+  if (_sse) { _sse.close(); _sse = null; }
 }
 
 function showSyncBadge(msg) {
@@ -79,17 +97,16 @@ function showSyncBadge(msg) {
   if (!el) {
     el = document.createElement('div');
     el.id = 'sync-badge';
-    el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.75);color:#fff;font-size:0.72rem;padding:4px 14px;border-radius:99px;z-index:999;pointer-events:none;';
+    el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);background:rgba(20,20,40,0.9);color:#fff;font-size:0.7rem;padding:4px 14px;border-radius:99px;z-index:999;pointer-events:none;backdrop-filter:blur(6px);';
     document.body.appendChild(el);
   }
-  el.textContent = msg;
-  el.style.display = 'block';
+  el.textContent = msg; el.style.opacity = '1';
 }
 function hideSyncBadge(msg) {
   const el = document.getElementById('sync-badge');
   if (!el) return;
-  if (msg) { el.textContent = msg; setTimeout(() => { el.style.display = 'none'; }, 1500); }
-  else el.style.display = 'none';
+  if (msg) { el.textContent = msg; setTimeout(() => { el.style.opacity = '0'; }, 1200); }
+  else el.style.opacity = '0';
 }
 
 // ─── DB ──────────────────────────────────────────────────────
@@ -99,8 +116,7 @@ const DB = {
   set(p, k, v) {
     const key = DB.k(p, k);
     localStorage.setItem(key, JSON.stringify(v));
-    // push to Firebase (skip photos — too large for REST)
-    if (!k.includes('photo')) SYNC.push(`data/${key}`, v);
+    if (!k.includes('photo')) { _ignoreNextRender = true; fbPush(key, v); }
   },
 
   getMeals(p, date)       { return DB.get(p, `meals_${date}`) || {}; },
@@ -277,54 +293,70 @@ const FOOD_DB_LOCAL = [
   { keys:['מיץ תפוזים','מיץ'],                   per100:{kcal:45, protein:0.7,carbs:10,fat:0.2}, serving:250 },
 ];
 
-// Unit → grams multiplier
+// Unit → grams
 const UNITS = {
-  'גרם': 1, 'ג׳': 1, 'גר': 1, 'גר׳': 1,
-  'ק"ג': 1000, 'קג': 1000, 'קילו': 1000,
-  'כוס': 240, 'כוסות': 240,
-  'כף': 15, 'כפות': 15,
-  'כפית': 5, 'כפיות': 5,
-  'מנה': 1, // will use serving
-  'יחידה': 1, 'יחידות': 1,
-  'חצי': 0.5, 'רבע': 0.25,
-  'פרוסה': 1, 'פרוסות': 1,
-  'קופסה': 1, 'צלחת': 1,
-  'מ"ל': 1, 'מל': 1, 'ליטר': 1000,
+  'גרם':1,'ג׳':1,'גר':1,'גר׳':1,
+  'ק"ג':1000,'קג':1000,'קילו':1000,
+  'כוס':240,'כוסות':240,
+  'כף':15,'כפות':15,
+  'כפית':5,'כפיות':5,
+  'פרוסה':35,'פרוסות':35,
+  'מ"ל':1,'מל':1,'ליטר':1000,
 };
+const UNIT_PAT = Object.keys(UNITS).sort((a,b)=>b.length-a.length).join('|');
 
-// Hebrew word → number map
-const HE_NUMS = {
-  'אחד':1,'אחת':1,'אחד וחצי':1.5,'אחת וחצי':1.5,
-  'שניים':2,'שתיים':2,'שתי':2,'שני':2,'שתי וחצי':2.5,
-  'שלושה':3,'שלוש':3,'ארבעה':4,'ארבע':4,
-  'חמישה':5,'חמש':5,'שישה':6,'שש':6,
-  'שבעה':7,'שבע':7,'שמונה':8,'תשעה':9,'תשע':9,
-  'עשרה':10,'עשר':10,
-};
+// Hebrew word → count (must appear as standalone word)
+const HE_NUMS = [
+  ['אחד וחצי',1.5],['אחת וחצי',1.5],['שתי וחצי',2.5],
+  ['שניים',2],['שתיים',2],['שלושה',3],['ארבעה',4],['חמישה',5],
+  ['שישה',6],['שבעה',7],['שמונה',8],['תשעה',9],['עשרה',10],
+  ['שתי',2],['שני',2],['שלוש',3],['ארבע',4],['חמש',5],
+  ['שש',6],['שבע',7],['תשע',9],['עשר',10],
+  ['אחד',1],['אחת',1],
+];
+
+function wordIn(text, word) {
+  // true only when word stands alone (surrounded by space/start/end/punctuation)
+  const re = new RegExp(`(?:^|[\\s,])${word}(?=[\\s,]|$)`);
+  return re.test(text);
+}
 
 function extractQty(nearby, serving) {
-  // 1. Hebrew word numbers (longest match first)
-  for (const [word, val] of Object.entries(HE_NUMS).sort((a,b)=>b[0].length-a[0].length)) {
-    if (nearby.includes(word)) return val * serving;
-  }
-  // 2. Half / quarter without digits
-  if (/חצי|½/.test(nearby) && !/\d/.test(nearby.slice(0,nearby.search(/חצי|½/)))) return serving * 0.5;
-  if (/רבע|¼/.test(nearby) && !/\d/.test(nearby.slice(0,nearby.search(/רבע|¼/)))) return serving * 0.25;
-  // 3. Digit + unit
-  const unitPat = 'גרם|ג׳|גר|ק"ג|קג|קילו|כוס|כוסות|כף|כפות|כפית|כפיות|מ"ל|מל|ליטר';
-  const withUnit = nearby.match(new RegExp(`(\\d+(?:[.,]\\d+)?)\\s*(${unitPat})`));
+  const t = nearby;
+
+  // 1. Digit + unit  (e.g. "200 גרם", "3 כפות", "2 פרוסות")
+  const withUnit = t.match(new RegExp(`(\\d+(?:[.,]\\d+)?)\\s*(${UNIT_PAT})`));
   if (withUnit) {
-    const num = parseFloat(withUnit[1].replace(',','.'));
-    const u   = withUnit[2];
-    return num * (UNITS[u] || 1);
+    const num = parseFloat(withUnit[1].replace(',', '.'));
+    return num * UNITS[withUnit[2]];
   }
-  // 4. Bare digit(s)
-  const bareNum = nearby.match(/(\d+(?:[.,]\d+)?)/);
+
+  // 2. Hebrew number word + optional unit  (e.g. "שתי ביצים", "שלוש כפות")
+  for (const [word, val] of HE_NUMS) {
+    if (!wordIn(t, word)) continue;
+    // check if a unit follows the number word
+    const afterWord = t.slice(t.search(word) + word.length);
+    const unitMatch = afterWord.match(new RegExp(`^\\s*(${UNIT_PAT})`));
+    if (unitMatch) return val * UNITS[unitMatch[1]];
+    return val * serving;
+  }
+
+  // 3. Bare unit word without digit (e.g. "כוס שיבולת שועל", "כף שמן")
+  const bareUnit = t.match(new RegExp(`(?:^|\\s)(${UNIT_PAT})(?=\\s|$)`));
+  if (bareUnit && UNITS[bareUnit[1]] > 1) return UNITS[bareUnit[1]];
+
+  // 4. חצי / רבע
+  if (/חצי|½/.test(t)) return serving * 0.5;
+  if (/רבע|¼/.test(t))  return serving * 0.25;
+
+  // 5. Bare digit  (e.g. "2 ביצים")
+  const bareNum = t.match(/(\d+(?:[.,]\d+)?)/);
   if (bareNum) {
-    const num = parseFloat(bareNum[1].replace(',','.'));
+    const num = parseFloat(bareNum[1].replace(',', '.'));
     if (num > 0 && num <= 2000) return num < 10 ? num * serving : num;
   }
-  return serving; // fallback: 1 serving
+
+  return serving;
 }
 
 function estimateCaloriesLocal(text) {
@@ -460,6 +492,7 @@ function enterProfile(profile) {
   state.tab = 'home';
   document.body.className = PROFILES[profile].theme;
   renderProfileScreen();
+  startRealtimeSync();
 }
 
 function renderProfileScreen() {
@@ -506,6 +539,7 @@ function renderProfileScreen() {
   renderActiveTab();
 
   document.getElementById('btn-back').addEventListener('click', () => {
+    stopRealtimeSync();
     document.body.className = '';
     renderLobby();
   });
@@ -1019,24 +1053,8 @@ function openWeightModal() {
 // ─── Settings Modal ───────────────────────────────────────────
 function openSettingsModal() {
   const goals = DB.getGoals(state.profile);
-  const fbUrl = SYNC.getUrl();
   openModal(`
-    <div class="modal-title">⚙️ הגדרות</div>
-
-    <div class="settings-section-title">☁️ סנכרון בין מכשירים</div>
-    <div style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-bottom:0.5rem;line-height:1.55;">
-      להסבר הגדרה: ראה הוראות למטה.<br>
-      הדבק את ה-Database URL מ-Firebase:
-    </div>
-    <input class="modal-input" id="s-fburl" type="url" inputmode="url"
-      placeholder="https://your-app-default-rtdb.firebaseio.com"
-      value="${fbUrl}" style="font-size:0.8rem;text-align:right;direction:ltr;">
-    ${fbUrl
-      ? `<button style="width:100%;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#34d399;border-radius:10px;padding:0.5rem;font-size:0.82rem;cursor:pointer;margin-bottom:0.75rem;" id="btn-sync-now">🔄 סנכרן עכשיו</button>`
-      : `<div style="font-size:0.75rem;color:rgba(255,255,255,0.3);margin-bottom:0.75rem;text-align:center;">ללא סנכרון — כל מכשיר שומר בנפרד</div>`
-    }
-
-    <div class="settings-section-title">🎯 יעדים יומיים</div>
+    <div class="modal-title">⚙️ יעדים יומיים</div>
     <div class="settings-goals-grid">
       <div class="sg-item"><label>קלוריות</label>
         <input class="modal-input sg-input" id="g-cal"   type="number" inputmode="numeric" value="${goals.calories}">
@@ -1060,12 +1078,7 @@ function openSettingsModal() {
     </div>
   `);
 
-  document.getElementById('btn-save-settings').addEventListener('click', async () => {
-    const newUrl = document.getElementById('s-fburl').value.trim();
-    if (newUrl !== fbUrl) {
-      SYNC.setUrl(newUrl);
-      if (newUrl) await syncFromFirebase();
-    }
+  document.getElementById('btn-save-settings').addEventListener('click', () => {
     DB.saveGoals(state.profile, {
       calories:     +document.getElementById('g-cal').value   || goals.calories,
       protein:      +document.getElementById('g-prot').value  || goals.protein,
@@ -1074,12 +1087,6 @@ function openSettingsModal() {
       targetWeight: +document.getElementById('g-tw').value    || goals.targetWeight,
     });
     closeModal();
-    renderActiveTab();
-  });
-
-  document.getElementById('btn-sync-now')?.addEventListener('click', async () => {
-    closeModal();
-    await syncFromFirebase();
     renderActiveTab();
   });
 }
@@ -1101,7 +1108,4 @@ function calcStreak(workouts) {
 }
 
 // ─── Boot ─────────────────────────────────────────────────────
-window.addEventListener('DOMContentLoaded', async () => {
-  await syncFromFirebase();   // pull latest from Firebase if configured
-  renderLobby();
-});
+window.addEventListener('DOMContentLoaded', renderLobby);
