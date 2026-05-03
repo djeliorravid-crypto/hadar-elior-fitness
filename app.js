@@ -36,10 +36,12 @@ const state = {
 };
 
 // ─── Firebase sync (REST, no SDK) ────────────────────────────
+const FIREBASE_URL = 'https://elior-hadar-default-rtdb.firebaseio.com';
+
 const SYNC = {
-  getUrl()      { return (localStorage.getItem('fc_firebase_url') || '').replace(/\/$/, ''); },
+  getUrl()      { return (localStorage.getItem('fc_firebase_url') || FIREBASE_URL).replace(/\/$/, ''); },
   setUrl(u)     { localStorage.setItem('fc_firebase_url', u.trim().replace(/\/$/, '')); },
-  hasUrl()      { return !!SYNC.getUrl(); },
+  hasUrl()      { return true; },
 
   async read(path) {
     try {
