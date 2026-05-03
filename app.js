@@ -46,50 +46,40 @@ function fbPush(key, value) {
   }).catch(() => {});
 }
 
-let _sse = null;
-let _ignoreNextRender = false;
+let _pollInterval = null;
 
 function startRealtimeSync() {
-  if (_sse) { _sse.close(); _sse = null; }
-
-  _sse = new EventSource(`${FIREBASE_URL}/data.json`);
-
-  _sse.addEventListener('put', e => {
-    try {
-      const { path, data } = JSON.parse(e.data);
-      if (!data) return;
-      if (path === '/') {
-        Object.entries(data).forEach(([k, v]) => {
-          if (!k.includes('photo')) localStorage.setItem(k, JSON.stringify(v));
-        });
-      } else {
-        const key = path.replace(/^\//, '');
-        if (!key.includes('photo')) localStorage.setItem(key, JSON.stringify(data));
-      }
-      if (state.profile && !_ignoreNextRender) {
-        renderActiveTab();
-        updateStreakBadge();
-      }
-      _ignoreNextRender = false;
-    } catch {}
-  });
-
-  _sse.addEventListener('patch', e => {
-    try {
-      const { path, data } = JSON.parse(e.data);
-      if (!data) return;
-      const base = path.replace(/^\//, '');
-      Object.entries(data).forEach(([k, v]) => {
-        const key = base ? `${base}/${k}` : k;
-        if (!key.includes('photo')) localStorage.setItem(key, JSON.stringify(v));
-      });
-      if (state.profile) { renderActiveTab(); updateStreakBadge(); }
-    } catch {}
-  });
+  if (_pollInterval) clearInterval(_pollInterval);
+  pollFirebase();
+  _pollInterval = setInterval(pollFirebase, 3000);
 }
 
 function stopRealtimeSync() {
-  if (_sse) { _sse.close(); _sse = null; }
+  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
+}
+
+async function pollFirebase() {
+  try {
+    const res = await fetch(`${FIREBASE_URL}/data.json`);
+    if (!res.ok) return;
+    const remote = await res.json();
+    if (!remote) return;
+
+    let changed = false;
+    Object.entries(remote).forEach(([k, v]) => {
+      if (k.includes('photo')) return;
+      const remoteStr = JSON.stringify(v);
+      if (localStorage.getItem(k) !== remoteStr) {
+        localStorage.setItem(k, remoteStr);
+        changed = true;
+      }
+    });
+
+    if (changed && state.profile) {
+      renderActiveTab();
+      updateStreakBadge();
+    }
+  } catch {}
 }
 
 function showSyncBadge(msg) {
@@ -116,7 +106,7 @@ const DB = {
   set(p, k, v) {
     const key = DB.k(p, k);
     localStorage.setItem(key, JSON.stringify(v));
-    if (!k.includes('photo')) { _ignoreNextRender = true; fbPush(key, v); }
+    if (!k.includes('photo')) fbPush(key, v);
   },
 
   getMeals(p, date)       { return DB.get(p, `meals_${date}`) || {}; },
@@ -343,7 +333,11 @@ function extractQty(nearby, serving) {
 
   // 3. Bare unit word without digit (e.g. "כוס שיבולת שועל", "כף שמן")
   const bareUnit = t.match(new RegExp(`(?:^|\\s)(${UNIT_PAT})(?=\\s|$)`));
-  if (bareUnit && UNITS[bareUnit[1]] > 1) return UNITS[bareUnit[1]];
+  if (bareUnit && UNITS[bareUnit[1]] > 1) {
+    // "כוס" without a digit is ambiguous (density varies) — use food's serving
+    if (bareUnit[1] === 'כוס' || bareUnit[1] === 'כוסות') return serving;
+    return UNITS[bareUnit[1]];
+  }
 
   // 4. חצי / רבע
   if (/חצי|½/.test(t)) return serving * 0.5;
@@ -360,34 +354,36 @@ function extractQty(nearby, serving) {
 }
 
 function estimateCaloriesLocal(text) {
-  const lower = text
-    .replace(/['"״]/g, '')
-    .replace(/[\-–]/g, ' ')
-    .replace(/,/g, ' ');
+  // Split by newlines/commas so each food's quantity is scoped to its own segment
+  const segments = text.split(/[\n,،]+/).map(s =>
+    s.replace(/['"״]/g, '').replace(/[\-–]/g, ' ').trim()
+  ).filter(Boolean);
+
+  if (segments.length === 0) segments.push(text);
 
   let totalKcal = 0, totalProtein = 0, totalCarbs = 0, totalFat = 0;
   const foundItems = [];
+  const counted = new Set();
 
-  for (const food of FOOD_DB_LOCAL) {
-    for (const key of food.keys) {
-      if (!lower.includes(key)) continue;
+  for (const seg of segments) {
+    for (const food of FOOD_DB_LOCAL) {
+      if (counted.has(food.keys[0])) continue;
+      for (const key of food.keys) {
+        if (!seg.includes(key)) continue;
 
-      const keyIdx = lower.indexOf(key);
-      const nearby = lower.slice(Math.max(0, keyIdx - 35), keyIdx + key.length + 35);
-      const grams  = extractQty(nearby, food.serving);
-      const scale  = grams / 100;
+        const keyIdx = seg.indexOf(key);
+        const nearby = seg.slice(Math.max(0, keyIdx - 35), keyIdx + key.length + 35);
+        const grams  = extractQty(nearby, food.serving);
+        const scale  = grams / 100;
 
-      const kcal    = Math.round(food.per100.kcal    * scale);
-      const protein = Math.round(food.per100.protein * scale * 10) / 10;
-      const carbs   = Math.round(food.per100.carbs   * scale * 10) / 10;
-      const fat     = Math.round(food.per100.fat     * scale * 10) / 10;
-
-      totalKcal    += kcal;
-      totalProtein += protein;
-      totalCarbs   += carbs;
-      totalFat     += fat;
-      foundItems.push({ name: food.keys[0], grams: Math.round(grams), kcal });
-      break;
+        totalKcal    += Math.round(food.per100.kcal    * scale);
+        totalProtein += Math.round(food.per100.protein * scale * 10) / 10;
+        totalCarbs   += Math.round(food.per100.carbs   * scale * 10) / 10;
+        totalFat     += Math.round(food.per100.fat     * scale * 10) / 10;
+        foundItems.push({ name: food.keys[0], grams: Math.round(grams), kcal: Math.round(food.per100.kcal * scale) });
+        counted.add(food.keys[0]);
+        break;
+      }
     }
   }
 
@@ -409,7 +405,7 @@ function renderLobby() {
   document.getElementById('app').innerHTML = `
     <div id="screen-lobby" class="screen">
       <div class="lobby-logo">⚖️</div>
-      <div class="lobby-title">יורדים במשקל ביחד</div>
+      <div class="lobby-title">אליאור ודרי בדרך להיות רזים ויפים אפילו יותר</div>
       <div class="lobby-sub">בחר פרופיל</div>
       <div class="profiles-row">
         ${profileBtnHTML('elior')}
