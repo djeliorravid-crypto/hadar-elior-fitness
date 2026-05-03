@@ -35,21 +35,78 @@ const state = {
   tab: 'home',
 };
 
+// ─── Firebase sync (REST, no SDK) ────────────────────────────
+const SYNC = {
+  getUrl()      { return (localStorage.getItem('fc_firebase_url') || '').replace(/\/$/, ''); },
+  setUrl(u)     { localStorage.setItem('fc_firebase_url', u.trim().replace(/\/$/, '')); },
+  hasUrl()      { return !!SYNC.getUrl(); },
+
+  async read(path) {
+    try {
+      const r = await fetch(`${SYNC.getUrl()}/${path}.json`);
+      return r.ok ? await r.json() : null;
+    } catch { return null; }
+  },
+
+  push(path, data) {
+    if (!SYNC.hasUrl()) return;
+    fetch(`${SYNC.getUrl()}/${path}.json`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }).catch(() => {});
+  },
+};
+
+// Pull all data from Firebase into localStorage (called on app load)
+async function syncFromFirebase() {
+  if (!SYNC.hasUrl()) return;
+  showSyncBadge('מסנכרן...');
+  try {
+    const all = await SYNC.read('data');
+    if (!all) { hideSyncBadge(); return; }
+    Object.entries(all).forEach(([k, v]) => {
+      // skip photos (too large, keep local)
+      if (!k.includes('_photo')) localStorage.setItem(k, JSON.stringify(v));
+    });
+    hideSyncBadge('✓ מסונכרן');
+  } catch { hideSyncBadge(); }
+}
+
+function showSyncBadge(msg) {
+  let el = document.getElementById('sync-badge');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'sync-badge';
+    el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.75);color:#fff;font-size:0.72rem;padding:4px 14px;border-radius:99px;z-index:999;pointer-events:none;';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+function hideSyncBadge(msg) {
+  const el = document.getElementById('sync-badge');
+  if (!el) return;
+  if (msg) { el.textContent = msg; setTimeout(() => { el.style.display = 'none'; }, 1500); }
+  else el.style.display = 'none';
+}
+
 // ─── DB ──────────────────────────────────────────────────────
 const DB = {
   k: (p, k) => `fc_${p}_${k}`,
   get(p, k)    { try { return JSON.parse(localStorage.getItem(DB.k(p,k))); } catch { return null; } },
-  set(p, k, v) { localStorage.setItem(DB.k(p,k), JSON.stringify(v)); },
+  set(p, k, v) {
+    const key = DB.k(p, k);
+    localStorage.setItem(key, JSON.stringify(v));
+    // push to Firebase (skip photos — too large for REST)
+    if (!k.includes('photo')) SYNC.push(`data/${key}`, v);
+  },
 
-  // Meals: { date: { breakfast:[...], lunch:[...], dinner:[...], snack:[...] } }
   getMeals(p, date)       { return DB.get(p, `meals_${date}`) || {}; },
   saveMeals(p, date, obj) { DB.set(p, `meals_${date}`, obj); },
 
-  // Workouts: [{ id, date, type, typeLabel, emoji, notes }]
   getWorkouts(p)      { return DB.get(p, 'workouts2') || []; },
   saveWorkouts(p, ws) { DB.set(p, 'workouts2', ws); },
 
-  // Weight: [{ date, value }]
   getWeight(p)        { return DB.get(p, 'weight') || []; },
   saveWeight(p, arr)  { DB.set(p, 'weight', arr); },
 
@@ -57,10 +114,7 @@ const DB = {
   saveGoals(p, g)     { DB.set(p, 'goals', g); },
 
   getPhoto(p)         { return DB.get(p, 'photo'); },
-  savePhoto(p, b64)   { DB.set(p, 'photo', b64); },
-
-  getApiKey()         { return localStorage.getItem('fc_apikey') || ''; },
-  saveApiKey(k)       { localStorage.setItem('fc_apikey', k); },
+  savePhoto(p, b64)   { DB.set(p, 'photo', b64); },  // saved locally only
 };
 
 // ─── Utilities ───────────────────────────────────────────────
@@ -236,8 +290,43 @@ const UNITS = {
   'מ"ל': 1, 'מל': 1, 'ליטר': 1000,
 };
 
+// Hebrew word → number map
+const HE_NUMS = {
+  'אחד':1,'אחת':1,'אחד וחצי':1.5,'אחת וחצי':1.5,
+  'שניים':2,'שתיים':2,'שתי':2,'שני':2,'שתי וחצי':2.5,
+  'שלושה':3,'שלוש':3,'ארבעה':4,'ארבע':4,
+  'חמישה':5,'חמש':5,'שישה':6,'שש':6,
+  'שבעה':7,'שבע':7,'שמונה':8,'תשעה':9,'תשע':9,
+  'עשרה':10,'עשר':10,
+};
+
+function extractQty(nearby, serving) {
+  // 1. Hebrew word numbers (longest match first)
+  for (const [word, val] of Object.entries(HE_NUMS).sort((a,b)=>b[0].length-a[0].length)) {
+    if (nearby.includes(word)) return val * serving;
+  }
+  // 2. Half / quarter without digits
+  if (/חצי|½/.test(nearby) && !/\d/.test(nearby.slice(0,nearby.search(/חצי|½/)))) return serving * 0.5;
+  if (/רבע|¼/.test(nearby) && !/\d/.test(nearby.slice(0,nearby.search(/רבע|¼/)))) return serving * 0.25;
+  // 3. Digit + unit
+  const unitPat = 'גרם|ג׳|גר|ק"ג|קג|קילו|כוס|כוסות|כף|כפות|כפית|כפיות|מ"ל|מל|ליטר';
+  const withUnit = nearby.match(new RegExp(`(\\d+(?:[.,]\\d+)?)\\s*(${unitPat})`));
+  if (withUnit) {
+    const num = parseFloat(withUnit[1].replace(',','.'));
+    const u   = withUnit[2];
+    return num * (UNITS[u] || 1);
+  }
+  // 4. Bare digit(s)
+  const bareNum = nearby.match(/(\d+(?:[.,]\d+)?)/);
+  if (bareNum) {
+    const num = parseFloat(bareNum[1].replace(',','.'));
+    if (num > 0 && num <= 2000) return num < 10 ? num * serving : num;
+  }
+  return serving; // fallback: 1 serving
+}
+
 function estimateCaloriesLocal(text) {
-  const lower = text.toLowerCase()
+  const lower = text
     .replace(/['"״]/g, '')
     .replace(/[\-–]/g, ' ')
     .replace(/,/g, ' ');
@@ -245,43 +334,15 @@ function estimateCaloriesLocal(text) {
   let totalKcal = 0, totalProtein = 0, totalCarbs = 0, totalFat = 0;
   const foundItems = [];
 
-  // For each food item in the DB try to find it in the text
   for (const food of FOOD_DB_LOCAL) {
     for (const key of food.keys) {
-      const keyLow = key.toLowerCase();
-      if (!lower.includes(keyLow)) continue;
+      if (!lower.includes(key)) continue;
 
-      // Try to extract quantity near this food mention
-      const keyIdx = lower.indexOf(keyLow);
+      const keyIdx = lower.indexOf(key);
+      const nearby = lower.slice(Math.max(0, keyIdx - 35), keyIdx + key.length + 35);
+      const grams  = extractQty(nearby, food.serving);
+      const scale  = grams / 100;
 
-      // Look for NUMBER [UNIT] before or after the food keyword (within 30 chars)
-      const nearby = lower.slice(Math.max(0, keyIdx - 30), keyIdx + keyLow.length + 30);
-
-      let grams = food.serving; // default
-      let foundQty = false;
-
-      // Pattern: number followed by optional unit
-      const numMatch = nearby.match(/(\d+(?:[.,]\d+)?)\s*(גרם|ג׳|גר|ק"ג|קג|קילו|כוס|כוסות|כף|כפות|כפית|כפיות|מ"ל|מל|ליטר)?/);
-      if (numMatch) {
-        const num = parseFloat(numMatch[1].replace(',', '.'));
-        const unit = numMatch[2] || '';
-        if (unit && UNITS[unit] && unit !== 'מנה' && unit !== 'יחידה') {
-          grams = num * UNITS[unit];
-          foundQty = true;
-        } else if (num > 0 && num <= 2000) {
-          // No unit → assume grams if >10, else count × serving
-          grams = num >= 10 ? num : num * food.serving;
-          foundQty = true;
-        }
-      }
-
-      // Multipliers from text context
-      const halfMatch = nearby.match(/חצי|½/);
-      const quarterMatch = nearby.match(/רבע|¼/);
-      if (halfMatch && !foundQty)    grams = food.serving * 0.5;
-      if (quarterMatch && !foundQty) grams = food.serving * 0.25;
-
-      const scale = grams / 100;
       const kcal    = Math.round(food.per100.kcal    * scale);
       const protein = Math.round(food.per100.protein * scale * 10) / 10;
       const carbs   = Math.round(food.per100.carbs   * scale * 10) / 10;
@@ -291,19 +352,15 @@ function estimateCaloriesLocal(text) {
       totalProtein += protein;
       totalCarbs   += carbs;
       totalFat     += fat;
-
       foundItems.push({ name: food.keys[0], grams: Math.round(grams), kcal });
-      break; // found this food, move to next food entry
+      break;
     }
   }
 
-  if (foundItems.length === 0) {
-    // fallback: rough estimate based on text length / common words
-    throw new Error('לא הצלחתי לזהות מאכלים בטקסט. נסה לפרט יותר — למשל "200 גרם אורז עם חזה עוף"');
-  }
+  if (foundItems.length === 0)
+    throw new Error('לא זיהיתי מאכלים בטקסט. נסה לפרט — "2 ביצים, 200 גרם אורז, חזה עוף"');
 
-  const summary = foundItems.map(i => `${i.name} (${i.grams}g, ${i.kcal} קל׳)`).join(' + ');
-
+  const summary = foundItems.map(i => `${i.name} (${i.grams}g · ${i.kcal} קל׳)`).join(' + ');
   return {
     kcal:    Math.round(totalKcal),
     protein: Math.round(totalProtein * 10) / 10,
@@ -960,27 +1017,38 @@ function openWeightModal() {
 // ─── Settings Modal ───────────────────────────────────────────
 function openSettingsModal() {
   const goals = DB.getGoals(state.profile);
+  const fbUrl = SYNC.getUrl();
   openModal(`
-    <div class="modal-title">⚙️ יעדים יומיים</div>
+    <div class="modal-title">⚙️ הגדרות</div>
+
+    <div class="settings-section-title">☁️ סנכרון בין מכשירים</div>
+    <div style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-bottom:0.5rem;line-height:1.55;">
+      להסבר הגדרה: ראה הוראות למטה.<br>
+      הדבק את ה-Database URL מ-Firebase:
+    </div>
+    <input class="modal-input" id="s-fburl" type="url" inputmode="url"
+      placeholder="https://your-app-default-rtdb.firebaseio.com"
+      value="${fbUrl}" style="font-size:0.8rem;text-align:right;direction:ltr;">
+    ${fbUrl
+      ? `<button style="width:100%;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#34d399;border-radius:10px;padding:0.5rem;font-size:0.82rem;cursor:pointer;margin-bottom:0.75rem;" id="btn-sync-now">🔄 סנכרן עכשיו</button>`
+      : `<div style="font-size:0.75rem;color:rgba(255,255,255,0.3);margin-bottom:0.75rem;text-align:center;">ללא סנכרון — כל מכשיר שומר בנפרד</div>`
+    }
+
+    <div class="settings-section-title">🎯 יעדים יומיים</div>
     <div class="settings-goals-grid">
-      <div class="sg-item">
-        <label>קלוריות</label>
+      <div class="sg-item"><label>קלוריות</label>
         <input class="modal-input sg-input" id="g-cal"   type="number" inputmode="numeric" value="${goals.calories}">
       </div>
-      <div class="sg-item">
-        <label>חלבון (g)</label>
+      <div class="sg-item"><label>חלבון (g)</label>
         <input class="modal-input sg-input" id="g-prot"  type="number" inputmode="numeric" value="${goals.protein}">
       </div>
-      <div class="sg-item">
-        <label>פחמימות (g)</label>
+      <div class="sg-item"><label>פחמימות (g)</label>
         <input class="modal-input sg-input" id="g-carbs" type="number" inputmode="numeric" value="${goals.carbs}">
       </div>
-      <div class="sg-item">
-        <label>שומן (g)</label>
+      <div class="sg-item"><label>שומן (g)</label>
         <input class="modal-input sg-input" id="g-fat"   type="number" inputmode="numeric" value="${goals.fat}">
       </div>
-      <div class="sg-item" style="grid-column:1/-1;">
-        <label>משקל יעד (ק"ג)</label>
+      <div class="sg-item" style="grid-column:1/-1;"><label>משקל יעד (ק"ג)</label>
         <input class="modal-input sg-input" id="g-tw"    type="number" inputmode="decimal" step="0.1" value="${goals.targetWeight}">
       </div>
     </div>
@@ -990,7 +1058,12 @@ function openSettingsModal() {
     </div>
   `);
 
-  document.getElementById('btn-save-settings').addEventListener('click', () => {
+  document.getElementById('btn-save-settings').addEventListener('click', async () => {
+    const newUrl = document.getElementById('s-fburl').value.trim();
+    if (newUrl !== fbUrl) {
+      SYNC.setUrl(newUrl);
+      if (newUrl) await syncFromFirebase();
+    }
     DB.saveGoals(state.profile, {
       calories:     +document.getElementById('g-cal').value   || goals.calories,
       protein:      +document.getElementById('g-prot').value  || goals.protein,
@@ -999,6 +1072,12 @@ function openSettingsModal() {
       targetWeight: +document.getElementById('g-tw').value    || goals.targetWeight,
     });
     closeModal();
+    renderActiveTab();
+  });
+
+  document.getElementById('btn-sync-now')?.addEventListener('click', async () => {
+    closeModal();
+    await syncFromFirebase();
     renderActiveTab();
   });
 }
@@ -1020,4 +1099,7 @@ function calcStreak(workouts) {
 }
 
 // ─── Boot ─────────────────────────────────────────────────────
-window.addEventListener('DOMContentLoaded', renderLobby);
+window.addEventListener('DOMContentLoaded', async () => {
+  await syncFromFirebase();   // pull latest from Firebase if configured
+  renderLobby();
+});
